@@ -1,7 +1,17 @@
+import 'dart:async';
 import 'dart:io';
 
+import 'package:flutter/foundation.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:localsend_app/model/state/server/server_state.dart';
+import 'package:localsend_app/pages/home_page.dart';
+import 'package:localsend_app/pages/home_page_controller.dart';
+import 'package:localsend_app/provider/network/server/controller/receive_controller.dart';
+import 'package:localsend_app/provider/network/server/server_utils.dart';
 import 'package:localsend_app/provider/selection/selected_sending_files_provider.dart';
+import 'package:localsend_isolates/isolate.dart';
 import 'package:localsend_isolates/rust/api/model.dart';
 import 'package:localsend_isolates/rust/frb_generated.dart';
 import 'package:mockito/mockito.dart';
@@ -34,6 +44,90 @@ void main() {
     expect(service.state.single.name, 'selected file.txt');
     expect(service.state.single.size, 8);
     expect(api.paths, [file.path]);
+  });
+
+  testWidgets('onShow loads an existing file URI and switches from Receive to Send', (tester) async {
+    debugDefaultTargetPlatformOverride = TargetPlatform.linux;
+    addTearDown(() => debugDefaultTargetPlatformOverride = null);
+    final api = _MetadataApi();
+    RustLib.initMock(api: api);
+    addTearDown(RustLib.dispose);
+    final ref = RefenaContainer();
+    final home = ref.read(homePageControllerProvider);
+    addTearDown(() {
+      home.controller.dispose();
+      ref.disposeContainer();
+    });
+
+    // ChangeTabAction must use a genuinely attached PageController, not a mocked action.
+    await tester.pumpWidget(
+      RefenaScope.withContainer(
+        container: ref,
+        ownsContainer: false,
+        child: MaterialApp(
+          home: PageView(
+            controller: home.controller,
+            children: [for (final tab in HomeTab.values) Center(child: Text(tab.name))],
+          ),
+        ),
+      ),
+    );
+    expect(ref.read(homePageControllerProvider).currentTab, HomeTab.receive);
+    expect(home.controller.page, HomeTab.receive.index.toDouble());
+
+    // Only the external window and native metadata boundaries are mocked.
+    const windowChannel = MethodChannel('window_manager');
+    final focused = Completer<void>();
+    tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(windowChannel, (call) async {
+      switch (call.method) {
+        case 'isMinimized':
+          return false;
+        case 'show':
+          return null;
+        case 'focus':
+          focused.complete();
+          return null;
+        default:
+          throw UnsupportedError('Unexpected window method: ${call.method}');
+      }
+    });
+    addTearDown(() => tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(windowChannel, null));
+    ServerState? serverState = const ServerState(alias: 'test', port: 53317, https: false, session: null, web: null);
+    final controller = ReceiveController(
+      ServerUtils(
+        refFunc: () => ref,
+        getState: () => serverState!,
+        getStateOrNull: () => serverState,
+        setState: (builder) => serverState = builder(serverState),
+      ),
+    );
+
+    // onShow returns void and starts real filesystem work. Wait outside fake time,
+    // subscribing before dispatch, with a bounded failure instead of pumpAndSettle.
+    await tester.runAsync(() async {
+      final directory = await Directory.systemTemp.createTemp();
+      try {
+        final file = File(p.join(directory.path, 'selected file.txt'));
+        await file.writeAsString('selected');
+        final sent = ref.stream(homePageControllerProvider).firstWhere((event) => event.next.currentTab == HomeTab.send);
+        controller.onShow(HttpServerShowEvent(args: [file.uri.toString()]));
+        await Future.wait([sent, focused.future]).timeout(const Duration(seconds: 5));
+
+        expect(ref.read(homePageControllerProvider).currentTab, HomeTab.send);
+        expect(home.controller.page, HomeTab.send.index.toDouble());
+        final selection = ref.read(selectedSendingFilesProvider);
+        expect(selection, hasLength(1));
+        expect(selection.single.path, file.path);
+        expect(selection.single.name, 'selected file.txt');
+        expect(selection.single.size, 8);
+        expect(api.paths, [file.path]);
+      } finally {
+        await directory.delete(recursive: true);
+      }
+    });
+    await tester.pump();
+    expect(find.text(HomeTab.send.name).hitTestable(), findsOneWidget);
+    await tester.pumpWidget(const SizedBox.shrink());
   });
 
   group('resolveArgPath', () {
